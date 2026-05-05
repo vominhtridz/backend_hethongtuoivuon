@@ -75,6 +75,7 @@ cron.schedule('0 * * * *', async () => {
 });
 
 // B. KIỂM TRA LỊCH TRÌNH TƯỚI (MỖI 1 PHÚT)
+// B. KIỂM TRA LỊCH TRÌNH TƯỚI (MỖI 1 PHÚT)
 cron.schedule('* * * * *', async () => {
     try {
         // Lấy giờ phút chuẩn của Việt Nam bất chấp server đặt ở Mỹ hay Singapore
@@ -84,12 +85,14 @@ cron.schedule('* * * * *', async () => {
         const currentMinute = vnDate.getMinutes();
         const currentMinutesTotal = currentHour * 60 + currentMinute;
 
+        console.log(`[DEBUG] Thời gian VN: ${vnTimeStr} | Giờ: ${currentHour} | Phút: ${currentMinute} | Tổng phút: ${currentMinutesTotal}`);
+
         const schedules = await Schedule.find();
         let isAnyScheduleRunning = false;
 
         // Quét tất cả các lịch trong DataBase
         for (let sched of schedules) {
-            if (!sched.time) continue;
+            if (!sched.time || !sched.isActive) continue; // Bỏ qua nếu lịch bị tắt (isActive = false)
             const [h, m] = sched.time.split(':').map(Number);
             const startMinutes = h * 60 + m;
             const endMinutes = startMinutes + sched.durationMinutes;
@@ -106,19 +109,25 @@ cron.schedule('* * * * *', async () => {
 
         // NẾU CÓ LỊCH ĐANG CHẠY MÀ TRƯỚC ĐÓ CỜ CHƯA BẬT (Tránh ghi log lặp lại mỗi phút)
         if (isAnyScheduleRunning && !state.isScheduleRunning) {
-            state.isScheduleRunning = true;
-            await state.save();
+            state.isScheduleRunning = true; // Bật cờ lịch trình
             
             if (!state.isRaining) {
+                state.pumpState = true; // <--- SỬA LỖI: BẬT BƠM TẠI ĐÂY
+                await state.save();
+                console.log(`[DEBUG] -> Đã BẬT cờ lịch trình & BẬT BƠM!`);
                 await History.create({ action: `⏰ ĐẾN GIỜ HẸN: Bắt đầu tưới tự động theo lịch (${currentHour}:${currentMinute < 10 ? '0'+currentMinute : currentMinute})` });
             } else {
+                await state.save(); // Vẫn lưu trạng thái cờ để không lặp lại log
+                console.log(`[DEBUG] -> Đến giờ nhưng BỎ QUA vì trời mưa!`);
                 await History.create({ action: '⏰ Đến giờ hẹn tưới, NHƯNG BỎ QUA do trời đang mưa!' });
             }
         } 
-        // NẾU HẾT LỊCH (HOẶC CHƯA TỚI) MÀ CỜ VẪN ĐANG BẬT -> TẮT CỜ ĐI VÀ GHI LOG
+        // NẾU HẾT LỊCH (HOẶC CHƯA TỚI) MÀ CỜ VẪN ĐANG BẬT -> TẮT CỜ VÀ TẮT BƠM
         else if (!isAnyScheduleRunning && state.isScheduleRunning) {
-            state.isScheduleRunning = false;
+            state.isScheduleRunning = false; // Tắt cờ lịch trình
+            state.pumpState = false;         // <--- SỬA LỖI: TẮT BƠM TẠI ĐÂY
             await state.save();
+            console.log(`[DEBUG] -> Đã TẮT cờ lịch trình & TẮT BƠM!`);
             await History.create({ action: `⏰ HẾT GIỜ HẸN: Đã tự động tắt bơm (${currentHour}:${currentMinute < 10 ? '0'+currentMinute : currentMinute})` });
         }
 
@@ -129,7 +138,6 @@ cron.schedule('* * * * *', async () => {
     scheduled: true,
     timezone: "Asia/Ho_Chi_Minh" // Ép múi giờ VN
 });
-
 
 // =========================================================================
 // 4. API Endpoints (Dành cho giao diện Web/App)
