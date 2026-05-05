@@ -17,7 +17,8 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb+srv://trilove156_db_user:HMDo
 const SystemStateSchema = new mongoose.Schema({
   pumpState: { type: Boolean, default: false }, 
   isRaining: { type: Boolean, default: false }, 
-  manualOverride: { type: Boolean, default: false } 
+  manualOverride: { type: Boolean, default: false },
+  isScheduleRunning: { type: Boolean, default: false } // THÊM CỜ: Để máy chủ biết lịch có đang chạy không
 });
 const State = mongoose.model('State', SystemStateSchema);
 
@@ -35,7 +36,11 @@ const HistorySchema = new mongoose.Schema({
 });
 const History = mongoose.model('History', HistorySchema);
 
-// 3. Tự động kiểm tra thời tiết tại Quảng Phú, Cư M'gar (Mỗi 1 giờ)
+// =========================================================================
+// 3. TÁC VỤ NGẦM (CRON JOBS) - ĐÃ ĐƯỢC ÉP CHẠY THEO GIỜ VIỆT NAM
+// =========================================================================
+
+// A. Tự động kiểm tra thời tiết tại Quảng Phú, Cư M'gar (Mỗi 1 giờ)
 cron.schedule('0 * * * *', async () => {
     try {
         const apiKey = process.env.WEATHER_API_KEY;
@@ -64,9 +69,71 @@ cron.schedule('0 * * * *', async () => {
     } catch (error) {
         console.error("Lỗi lấy dữ liệu thời tiết:", error.message);
     }
+}, {
+    scheduled: true,
+    timezone: "Asia/Ho_Chi_Minh" // Ép múi giờ VN
 });
 
+// B. KIỂM TRA LỊCH TRÌNH TƯỚI (MỖI 1 PHÚT)
+cron.schedule('* * * * *', async () => {
+    try {
+        // Lấy giờ phút chuẩn của Việt Nam bất chấp server đặt ở Mỹ hay Singapore
+        const vnTimeStr = new Date().toLocaleString("en-US", { timeZone: "Asia/Ho_Chi_Minh" });
+        const vnDate = new Date(vnTimeStr);
+        const currentHour = vnDate.getHours();
+        const currentMinute = vnDate.getMinutes();
+        const currentMinutesTotal = currentHour * 60 + currentMinute;
+
+        const schedules = await Schedule.find();
+        let isAnyScheduleRunning = false;
+
+        // Quét tất cả các lịch trong DataBase
+        for (let sched of schedules) {
+            if (!sched.time) continue;
+            const [h, m] = sched.time.split(':').map(Number);
+            const startMinutes = h * 60 + m;
+            const endMinutes = startMinutes + sched.durationMinutes;
+
+            // Nếu giờ VN hiện tại nằm gọn trong khung giờ cài đặt
+            if (currentMinutesTotal >= startMinutes && currentMinutesTotal < endMinutes) {
+                isAnyScheduleRunning = true;
+                break;
+            }
+        }
+
+        let state = await State.findOne();
+        if (!state) state = await State.create({});
+
+        // NẾU CÓ LỊCH ĐANG CHẠY MÀ TRƯỚC ĐÓ CỜ CHƯA BẬT (Tránh ghi log lặp lại mỗi phút)
+        if (isAnyScheduleRunning && !state.isScheduleRunning) {
+            state.isScheduleRunning = true;
+            await state.save();
+            
+            if (!state.isRaining) {
+                await History.create({ action: `⏰ ĐẾN GIỜ HẸN: Bắt đầu tưới tự động theo lịch (${currentHour}:${currentMinute < 10 ? '0'+currentMinute : currentMinute})` });
+            } else {
+                await History.create({ action: '⏰ Đến giờ hẹn tưới, NHƯNG BỎ QUA do trời đang mưa!' });
+            }
+        } 
+        // NẾU HẾT LỊCH (HOẶC CHƯA TỚI) MÀ CỜ VẪN ĐANG BẬT -> TẮT CỜ ĐI VÀ GHI LOG
+        else if (!isAnyScheduleRunning && state.isScheduleRunning) {
+            state.isScheduleRunning = false;
+            await state.save();
+            await History.create({ action: `⏰ HẾT GIỜ HẸN: Đã tự động tắt bơm (${currentHour}:${currentMinute < 10 ? '0'+currentMinute : currentMinute})` });
+        }
+
+    } catch (error) {
+        console.error("Lỗi duyệt lịch trình:", error);
+    }
+}, {
+    scheduled: true,
+    timezone: "Asia/Ho_Chi_Minh" // Ép múi giờ VN
+});
+
+
+// =========================================================================
 // 4. API Endpoints (Dành cho giao diện Web/App)
+// =========================================================================
 
 app.get('/api/status', async (req, res) => {
     let state = await State.findOne();
@@ -82,7 +149,7 @@ app.post('/api/pump', async (req, res) => {
     state.pumpState = pumpState;
     await state.save();
     
-    await History.create({ action: pumpState ? 'Người dùng BẬT bơm trên App' : 'Người dùng TẮT bơm trên App' });
+    await History.create({ action: pumpState ? 'Người dùng BẬT bơm thủ công trên App' : 'Người dùng TẮT bơm thủ công trên App' });
     res.json({ success: true, state });
 });
 
@@ -102,7 +169,7 @@ app.delete('/api/schedules/:id', async (req, res) => {
 });
 
 app.get('/api/history', async (req, res) => {
-    const history = await History.find().sort({ timestamp: -1 }).limit(50); // Tăng lên 50 dòng để dễ nhìn
+    const history = await History.find().sort({ timestamp: -1 }).limit(50); // Lấy 50 dòng mới nhất
     res.json(history);
 });
 
@@ -133,9 +200,9 @@ app.post('/api/esp/log', async (req, res) => {
     const { date, errors } = req.body;
     
     if (errors && errors.trim() !== "") {
-        await History.create({ action: `[BÁO CÁO LỖI THIẾT BỊ] Ngày ${date}: ${errors}` });
+        await History.create({ action: `[BÁO CÁO LỖI THIẾT BỊ] ESP32 gửi: ${errors}` });
     } else {
-        await History.create({ action: `[HỆ THỐNG] Đã tự động Reset định kỳ lúc 02:00 sáng để dọn dẹp bộ nhớ (Không có lỗi).` });
+        await History.create({ action: `[HỆ THỐNG] Mạch ESP32 đã tự động Reset định kỳ lúc 02:00 sáng để dọn dẹp bộ nhớ an toàn.` });
     }
     
     res.json({ success: true });
